@@ -1,0 +1,108 @@
+# Tests the action against real runners. An action that is only exercised by
+# its consumers is one that breaks in their repositories rather than this one,
+# so this drives the whole slang -> SPIR-V -> GLSL ES chain on every push.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  toolchain:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up the shader toolchain
+        id: toolchain
+        uses: ./
+        with:
+          # Linux only; the action warns and continues on Windows, which is
+          # itself worth exercising from a matrix that passes one value.
+          install-gl-stack: "true"
+
+      - name: The advertised outputs point at real directories
+        shell: bash
+        env:
+          TOOLCHAIN_DIR: ${{ steps.toolchain.outputs.toolchain-dir }}
+          SLANG_DIR: ${{ steps.toolchain.outputs.slang-dir }}
+          GLSLANG_DIR: ${{ steps.toolchain.outputs.glslang-dir }}
+          SPIRV_CROSS_DIR: ${{ steps.toolchain.outputs.spirv-cross-dir }}
+        run: |
+          for d in "$TOOLCHAIN_DIR" "$SLANG_DIR" "$GLSLANG_DIR" "$SPIRV_CROSS_DIR"; do
+            test -d "$d" || { echo "::error::output points at a missing directory: $d"; exit 1; }
+            echo "ok: $d"
+          done
+
+      - name: Compile a shader through the whole chain
+        shell: bash
+        # The real test. Version flags only prove the binaries start; this
+        # proves they interoperate, which is what a caller depends on.
+        run: |
+          set -x
+          slangc tests/smoke.slang -target spirv -entry fragmentMain \
+            -stage fragment -o "$RUNNER_TEMP/smoke.spv"
+          test -s "$RUNNER_TEMP/smoke.spv"
+
+          spirv-cross --version 300 --es "$RUNNER_TEMP/smoke.spv" \
+            --output "$RUNNER_TEMP/smoke.glsl"
+          grep -q "#version 300 es" "$RUNNER_TEMP/smoke.glsl"
+
+          glslang -S frag "$RUNNER_TEMP/smoke.glsl"
+
+      - name: A GL context is available
+        if: runner.os == 'Linux'
+        # Only meaningful where install-gl-stack did something. Callers that
+        # execute shaders depend on this, so it is verified rather than assumed.
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          python -m pip install --upgrade pip
+          pip install moderngl
+          xvfb-run -a python -c "
+          import moderngl
+          ctx = moderngl.create_standalone_context()
+          print('GL_RENDERER:', ctx.info['GL_RENDERER'])
+          print('GL_VERSION :', ctx.info['GL_VERSION'])
+          ctx.release()
+          "
+
+  rejects-unsupported-runner:
+    name: macOS is refused, clearly
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run the action, expecting it to fail
+        id: attempt
+        continue-on-error: true
+        uses: ./
+
+      - name: The failure must be the action's own, not an obscure one
+        shell: bash
+        # slang publishes no macOS asset, so the action refuses up front. If it
+        # ever starts succeeding here, that is a signal to add macOS support
+        # rather than a broken test.
+        run: |
+          if [ "${{ steps.attempt.outcome }}" != "failure" ]; then
+            echo "::error::the action succeeded on macOS; slang may now publish macOS assets."
+            exit 1
+          fi
+          echo "Refused on macOS, as intended."

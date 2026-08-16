@@ -1,0 +1,214 @@
+# Provision the Slang shader toolchain on a CI runner.
+#
+# The three tools are not pip-installable and only one of them publishes a
+# usable prebuilt binary for every platform, so every repository that compiles
+# Slang ends up writing the same six steps. This action is those steps, in one
+# place, with the version pins as inputs.
+#
+# It verifies the tools are runnable before returning. That is the point of it:
+# a download that half-worked otherwise leaves the tools missing, the calling
+# repository's tests skip rather than fail, and the job reports green having
+# checked nothing.
+
+name: Set up the shader toolchain
+description: >-
+  Install slangc, spirv-cross and glslang on an Ubuntu or Windows runner, put
+  them on PATH, and verify they run. Optionally install a software GL stack for
+  shaders that are executed rather than only compiled.
+
+branding:
+  icon: layers
+  color: purple
+
+inputs:
+  slang-version:
+    description: slang release tag, without the leading v.
+    required: false
+    default: "2026.12.0.1"
+  glslang-version:
+    description: glslang release tag.
+    required: false
+    default: "16.5.0"
+  spirv-cross-tag:
+    description: >-
+      SPIRV-Cross tag to build from source. It publishes no usable prebuilt
+      binaries — its newest release assets date from 2021 and target Ubuntu
+      trusty and VS2017 — so it is built here and cached between runs.
+    required: false
+    default: "vulkan-sdk-1.4.357.0"
+  install-gl-stack:
+    description: >-
+      Also install Mesa's software renderer and Xvfb, for tests that execute a
+      shader rather than only compiling it. Linux only; ignored with a warning
+      on Windows, so a matrix job can pass the same value for both. Run such
+      tests under `xvfb-run -a` with LIBGL_ALWAYS_SOFTWARE=1.
+    required: false
+    default: "false"
+  toolchain-dir:
+    description: >-
+      Directory to install into. Defaults to `.toolchain` in the workspace.
+    required: false
+    default: ""
+
+outputs:
+  toolchain-dir:
+    description: Directory the toolchain was installed under.
+    value: ${{ steps.paths.outputs.dir }}
+  slang-dir:
+    description: Root of the extracted slang archive (contains bin/ and lib/).
+    value: ${{ steps.paths.outputs.dir }}/slang
+  glslang-dir:
+    description: Root of the extracted glslang archive (contains bin/).
+    value: ${{ steps.paths.outputs.dir }}/glslang
+  spirv-cross-dir:
+    description: Root of the spirv-cross install (contains bin/).
+    value: ${{ steps.paths.outputs.dir }}/spirv-cross
+
+runs:
+  using: composite
+  steps:
+    - name: Check the runner is supported
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Linux|Windows) ;;
+          *)
+            echo "::error::setup-shader-toolchain supports Linux and Windows runners; got $RUNNER_OS."
+            echo "macOS is unsupported because slang publishes no macOS release asset." >&2
+            exit 1
+            ;;
+        esac
+
+    - name: Resolve the toolchain directory
+      id: paths
+      shell: bash
+      env:
+        REQUESTED: ${{ inputs.toolchain-dir }}
+      run: |
+        dir="${REQUESTED:-$GITHUB_WORKSPACE/.toolchain}"
+        mkdir -p "$dir"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+    - name: Restore the spirv-cross build
+      id: spirv-cross-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.paths.outputs.dir }}/spirv-cross
+        key: spirv-cross-${{ runner.os }}-${{ inputs.spirv-cross-tag }}
+
+    - name: Build spirv-cross
+      if: steps.spirv-cross-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        TAG: ${{ inputs.spirv-cross-tag }}
+        TOOLCHAIN_DIR: ${{ steps.paths.outputs.dir }}
+      # One step for both platforms: the configure line is identical and only
+      # the output path differs, because the Visual Studio generator is
+      # multi-config and puts binaries under a per-configuration directory.
+      run: |
+        git clone --depth 1 --branch "$TAG" \
+          https://github.com/KhronosGroup/SPIRV-Cross.git "$RUNNER_TEMP/spirv-cross-src"
+        cmake -S "$RUNNER_TEMP/spirv-cross-src" -B "$RUNNER_TEMP/spirv-cross-build" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DSPIRV_CROSS_CLI=ON \
+          -DSPIRV_CROSS_ENABLE_TESTS=OFF
+        cmake --build "$RUNNER_TEMP/spirv-cross-build" --config Release --parallel
+        mkdir -p "$TOOLCHAIN_DIR/spirv-cross/bin"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          cp "$RUNNER_TEMP/spirv-cross-build/Release/spirv-cross.exe" \
+             "$TOOLCHAIN_DIR/spirv-cross/bin/"
+        else
+          cp "$RUNNER_TEMP/spirv-cross-build/spirv-cross" \
+             "$TOOLCHAIN_DIR/spirv-cross/bin/"
+        fi
+
+    - name: Install slangc
+      shell: bash
+      env:
+        SLANG_VERSION: ${{ inputs.slang-version }}
+        TOOLCHAIN_DIR: ${{ steps.paths.outputs.dir }}
+      # slang ships a .tar.gz for both platforms, and Windows runners carry a
+      # tar that reads it, so one extraction path serves both.
+      run: |
+        mkdir -p "$TOOLCHAIN_DIR/slang"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          platform="windows-x86_64"
+        else
+          platform="linux-x86_64"
+        fi
+        curl -fsSL -o "$RUNNER_TEMP/slang.tar.gz" \
+          "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-${platform}.tar.gz"
+        tar -xzf "$RUNNER_TEMP/slang.tar.gz" -C "$TOOLCHAIN_DIR/slang"
+
+    - name: Install glslang
+      shell: bash
+      env:
+        GLSLANG_VERSION: ${{ inputs.glslang-version }}
+        TOOLCHAIN_DIR: ${{ steps.paths.outputs.dir }}
+      # glslang publishes a .tar.gz for Linux but only a .zip for Windows, so
+      # the archive format differs even though the layout does not.
+      run: |
+        mkdir -p "$TOOLCHAIN_DIR/glslang"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          curl -fsSL -o "$RUNNER_TEMP/glslang.zip" \
+            "https://github.com/KhronosGroup/glslang/releases/download/${GLSLANG_VERSION}/glslang-${GLSLANG_VERSION}-windows-x86_64-release.zip"
+          powershell -NoProfile -Command \
+            "Expand-Archive -Path '$RUNNER_TEMP/glslang.zip' -DestinationPath '$TOOLCHAIN_DIR/glslang' -Force"
+        else
+          curl -fsSL -o "$RUNNER_TEMP/glslang.tar.gz" \
+            "https://github.com/KhronosGroup/glslang/releases/download/${GLSLANG_VERSION}/glslang-${GLSLANG_VERSION}-linux-x86_64-release.tar.gz"
+          tar -xzf "$RUNNER_TEMP/glslang.tar.gz" -C "$TOOLCHAIN_DIR/glslang"
+          # The published archives do not reliably carry the executable bit.
+          chmod +x "$TOOLCHAIN_DIR/glslang/bin/glslang"
+        fi
+
+    - name: Put the toolchain on PATH
+      shell: bash
+      env:
+        TOOLCHAIN_DIR: ${{ steps.paths.outputs.dir }}
+      run: |
+        echo "$TOOLCHAIN_DIR/slang/bin" >> "$GITHUB_PATH"
+        echo "$TOOLCHAIN_DIR/spirv-cross/bin" >> "$GITHUB_PATH"
+        echo "$TOOLCHAIN_DIR/glslang/bin" >> "$GITHUB_PATH"
+        # slangc links against shared libraries shipped in the archive rather
+        # than beside the executable. Linux finds them through the loader path;
+        # Windows searches PATH, so lib/ goes on it there.
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          echo "$TOOLCHAIN_DIR/slang/lib" >> "$GITHUB_PATH"
+        else
+          echo "LD_LIBRARY_PATH=$TOOLCHAIN_DIR/slang/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+        fi
+
+    - name: Install a software GL stack
+      if: inputs.install-gl-stack == 'true'
+      shell: bash
+      # Mesa's llvmpipe provides a GL context in software and Xvfb gives the
+      # x11 backend a display to connect to, which avoids depending on which
+      # backend the caller's GL binding picks by default.
+      run: |
+        if [ "$RUNNER_OS" != "Linux" ]; then
+          echo "::warning::install-gl-stack is Linux-only; skipping on $RUNNER_OS."
+          echo "Tests that need a GL context will skip on this runner." >&2
+          exit 0
+        fi
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          xvfb libgl1 libglx-mesa0 libgl1-mesa-dri libegl1
+
+    - name: Verify the toolchain is runnable
+      shell: bash
+      # slangc and glslang are executed rather than merely located, because
+      # both link against libraries shipped alongside them — the failure a
+      # presence check misses and the PATH/LD_LIBRARY_PATH step above exists to
+      # prevent. spirv-cross has no version flag that reliably exits zero, so
+      # it is presence-checked and exercised by the caller's own tests.
+      run: |
+        for tool in slangc spirv-cross glslang; do
+          command -v "$tool" >/dev/null || {
+            echo "::error::$tool was not provisioned onto PATH"
+            exit 1
+          }
+        done
+        slangc -v
+        glslang --version
+        echo "Shader toolchain ready on $RUNNER_OS."
