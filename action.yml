@@ -127,8 +127,13 @@ runs:
       env:
         SLANG_VERSION: ${{ inputs.slang-version }}
         TOOLCHAIN_DIR: ${{ steps.paths.outputs.dir }}
-      # slang ships a .tar.gz for both platforms, and Windows runners carry a
-      # tar that reads it, so one extraction path serves both.
+      # slang ships a .tar.gz for both platforms, so one archive format serves
+      # both — but not one set of paths. Git Bash provides GNU tar, which reads
+      # an argument containing a colon as a remote host spec, so a Windows path
+      # like D:\a\_temp\slang.tar.gz is taken as host "D" and fails with
+      # "Cannot connect to D: resolve failed". cygpath converts to the POSIX
+      # form GNU tar expects. Only tar needs this; curl and cp accept the
+      # native paths.
       run: |
         mkdir -p "$TOOLCHAIN_DIR/slang"
         if [ "$RUNNER_OS" = "Windows" ]; then
@@ -138,7 +143,13 @@ runs:
         fi
         curl -fsSL -o "$RUNNER_TEMP/slang.tar.gz" \
           "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-${platform}.tar.gz"
-        tar -xzf "$RUNNER_TEMP/slang.tar.gz" -C "$TOOLCHAIN_DIR/slang"
+        archive="$RUNNER_TEMP/slang.tar.gz"
+        dest="$TOOLCHAIN_DIR/slang"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          archive=$(cygpath -u "$archive")
+          dest=$(cygpath -u "$dest")
+        fi
+        tar -xzf "$archive" -C "$dest"
 
     - name: Install glslang
       shell: bash
